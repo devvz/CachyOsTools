@@ -55,15 +55,31 @@ iso_initramfs_tool() {
     else iso_die 'The source needs mkinitcpio or dracut to regenerate its boot image.'; fi
 }
 
+# True when the source is really set up for Limine: the package files plus a sign it
+# is configured (CachyOS's /etc/default/limine and limine-entry-tool config, or a
+# limine.conf). Having the package installed alone must not change the bootloader
+# chosen for a GRUB or systemd-boot source.
+iso_uses_limine() {
+    local root=$1 marker
+    [[ -x $root/usr/bin/limine && -s $root/usr/share/limine/BOOTX64.EFI ]] || return 1
+    for marker in etc/default/limine etc/limine-entry-tool.conf boot/limine.conf boot/limine/limine.conf \
+                  efi/limine.conf efi/EFI/BOOT/limine.conf boot/EFI/BOOT/limine.conf boot/EFI/limine/limine.conf; do
+        [[ -e $root/$marker ]] && return 0
+    done
+    return 1
+}
+
 iso_bootloader() {
     local root=$1 mode=$2
     if [[ -x $root/usr/bin/grub-install && -d $root/usr/lib/grub/$mode ]]; then
         printf 'grub\n'
+    elif [[ $mode == x86_64-efi ]] && iso_uses_limine "$root"; then
+        printf 'limine\n'
     elif [[ $mode == x86_64-efi && -x $root/usr/bin/bootctl &&
             -s $root/usr/lib/systemd/boot/efi/systemd-bootx64.efi ]]; then
         printf 'systemd-boot\n'
     else
-        iso_die "This snapshot has no supported $mode bootloader. Install GRUB in the source, or use UEFI with systemd-boot available."
+        iso_die "This snapshot has no supported $mode bootloader. Install GRUB in the source, or use UEFI with Limine or systemd-boot available."
     fi
 }
 

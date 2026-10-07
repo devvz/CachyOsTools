@@ -337,7 +337,7 @@ installer_main() {
         summary+="  New root partition: $(((SEL_END - SEL_START - esp_mib) / 1024)) GiB (ext4)"$'\n\n'
         summary+='Existing partitions (Windows etc.) are NOT modified. Only two new'$'\n'
         summary+='partition table entries are written, inside the free region above.'$'\n'
-        summary+='Secure Boot must stay disabled to boot the restored system.'
+        summary+='Keep Secure Boot off while restoring; the restored system can use it only if it carries sbctl keys.'
         danger="Create the two new partitions on $disk now and install the cloned system into them?"
         ;;
     parts)
@@ -348,7 +348,7 @@ installer_main() {
         summary+="  ROOT (ext4):  $SEL_ROOT  ($(lsblk -dno SIZE,FSTYPE,LABEL "$SEL_ROOT" | sed 's/  */ /g'))"$'\n'
         summary+="  EFI  (FAT32): $SEL_ESP  ($(lsblk -dno SIZE,FSTYPE,LABEL "$SEL_ESP" | sed 's/  */ /g'))"$'\n\n'
         summary+='Both partitions will be FORMATTED: their contents are permanently erased.'$'\n'
-        summary+='No other partition is modified. Secure Boot must stay disabled.'
+        summary+='No other partition is modified. Keep Secure Boot off while restoring.'
         danger="LAST CHANCE: erase $SEL_ROOT and $SEL_ESP and install the cloned system?"
         for part in "$SEL_ROOT" "$SEL_ESP"; do
             if [[ -n $(blkid -p -o value -s TYPE "$part" 2>/dev/null) ]]; then typed+=("$part"); fi
@@ -458,6 +458,7 @@ Type = Path
 Target = usr/lib/modules/*/vmlinuz
 Target = usr/lib/modules/*/pkgbase
 Target = boot/vmlinuz-*
+Target = usr/share/limine/BOOTX64.EFI
 [Action]
 Description = Updating the restored system's boot files...
 When = PostTransaction
@@ -495,6 +496,10 @@ HOOK
         else
             arch-chroot "$TARGET" grub-install --target=i386-pc "$disk"
         fi
+    elif [[ $loader == limine ]]; then
+        # xetal-update-boot above already deployed limine.conf, the kernels and the Limine
+        # binary (config hash enrolled and signed when sbctl keys exist) on the EFI partition.
+        echo '[i] Limine was deployed to the EFI partition (/EFI/BOOT/BOOTX64.EFI and limine.conf).'
     else
         if (( sb_sign )); then
             # bootctl prefers the .signed variant, so later bootctl updates stay signed too.
@@ -518,7 +523,7 @@ HOOK
     if [[ $install_mode != wipe ]]; then
         echo "[i] The restored system boots from its own EFI partition ($esp)."
         echo '[i] Other operating systems were not touched. Choose the new entry from your firmware boot menu (often F12, F8 or Esc).'
-        echo '[i] Secure Boot has to remain disabled for this unsigned bootloader.'
+        if (( ! sb_sign )); then echo '[i] Secure Boot has to remain disabled for this unsigned bootloader.'; fi
     fi
     echo '[6/6] Installation complete. Remove the USB and reboot when ready.'
 }

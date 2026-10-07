@@ -7,15 +7,24 @@ restore_boot_main() {
     [[ $EUID == 0 ]] || { iso_die 'Boot regeneration requires root.'; return 1; }
     source /etc/xetal-boot.conf
     [[ $ROOT_UUID =~ ^[a-fA-F0-9-]+$ ]] || { iso_die 'Invalid root UUID.'; return 1; }
-    [[ $BOOTLOADER == grub || $BOOTLOADER == systemd-boot ]] || return 1
+    [[ $BOOTLOADER == grub || $BOOTLOADER == systemd-boot || $BOOTLOADER == limine ]] || return 1
     local tool kernels version pkgbase kernel image microcode entry entry_tmp config_tmp
+    local limine_conf=/efi/EFI/BOOT/limine.conf limine_efi=/efi/EFI/BOOT/BOOTX64.EFI limine_hash=0
     local -a post_options=()
     tool=$(iso_initramfs_tool /) || return 1
     kernels=$(iso_kernels /) || return 1
     mkdir -p /boot/xetal
-    if [[ $BOOTLOADER == systemd-boot ]]; then
+    if [[ $BOOTLOADER == systemd-boot || $BOOTLOADER == limine ]]; then
         mountpoint -q /efi || { iso_die 'Mount the EFI system partition at /efi before updating boot files.'; return 1; }
-        mkdir -p /efi/loader/entries /efi/Xetal
+        mkdir -p /efi/Xetal
+    fi
+    if [[ $BOOTLOADER == systemd-boot ]]; then mkdir -p /efi/loader/entries; fi
+    if [[ $BOOTLOADER == limine ]]; then
+        mkdir -p /efi/EFI/BOOT
+        # With sbctl keys present, pin every file by hash so the config can be enrolled
+        # into the (signed) Limine binary and Limine boots under Secure Boot.
+        if iso_sbctl_ready; then limine_hash=1; fi
+        printf 'timeout: 5\n' > "$limine_conf.new"
     fi
 
     # The restored root is a new, unencrypted ext4 filesystem. Do not embed the
@@ -76,12 +85,29 @@ EOF
             } > "$entry_tmp"
             mv "$entry_tmp" "$entry"
         fi
+        if [[ $BOOTLOADER == limine ]]; then
+            # Kernel and initramfs live on the FAT EFI partition, which Limine always reads.
+            cp "/boot/xetal/vmlinuz-$version" "/efi/Xetal/vmlinuz-$version"
+            cp "$image" "/efi/Xetal/initramfs-$version.img"
+            {
+                printf '\n/Cloned system - %s\n    protocol: linux\n' "$pkgbase"
+                printf '    path: boot():/Xetal/vmlinuz-%s%s\n' "$version" "$(restore_boot_hash "/efi/Xetal/vmlinuz-$version")"
+                for microcode in /boot/intel-ucode.img /boot/amd-ucode.img; do
+                    if [[ -s $microcode ]]; then
+                        cp "$microcode" "/efi/Xetal/${microcode##*/}"
+                        printf '    module_path: boot():/Xetal/%s%s\n' "${microcode##*/}" "$(restore_boot_hash "/efi/Xetal/${microcode##*/}")"
+                    fi
+                done
+                printf '    module_path: boot():/Xetal/initramfs-%s.img%s\n' "$version" "$(restore_boot_hash "/efi/Xetal/initramfs-$version.img")"
+                printf '    cmdline: root=UUID=%s rw\n' "$ROOT_UUID"
+            } >> "$limine_conf.new"
+        fi
     done <<< "$kernels"
     if [[ $BOOTLOADER == grub ]]; then
         mkdir -p /boot/grub
         grub-script-check "$config_tmp" || return 1
         mv "$config_tmp" /boot/grub/grub.cfg
-    else
+    elif [[ $BOOTLOADER == systemd-boot ]]; then
         rm "$config_tmp"
         printf 'default xetal-*\ntimeout 5\n' > /efi/loader/loader.conf
         # Remove only our entries for kernels that no longer exist.
@@ -92,8 +118,40 @@ EOF
                 rm -- "$entry" "/efi/Xetal/vmlinuz-$version" "/efi/Xetal/initramfs-$version.img"
             fi
         done
+    else
+        rm "$config_tmp"
+        restore_boot_limine "$limine_conf" "$limine_efi" "$limine_hash" || return 1
+        # Remove only our kernel and initramfs copies for kernels that no longer exist.
+        for image in /efi/Xetal/vmlinuz-* /efi/Xetal/initramfs-*.img; do
+            [[ -f $image ]] || continue
+            version=${image##*/}; version=${version#vmlinuz-}; version=${version#initramfs-}; version=${version%.img}
+            [[ -d /usr/lib/modules/$version ]] || rm -- "$image"
+        done
     fi
     echo '[*] Boot files regenerated successfully.'
+}
+
+# Prints "#<blake2b>" for FILE when Limine entries are hash-pinned, nothing otherwise.
+restore_boot_hash() {
+    (( ${limine_hash:-0} )) || return 0
+    printf '#%s' "$(b2sum -- "$1" | cut -d' ' -f1)"
+}
+
+# Deploy a fresh Limine binary and the new config. With hash pinning, the config's
+# BLAKE2b is enrolled into the binary first and the binary is signed afterwards
+# (signing must come last: enrolling changes the file).
+restore_boot_limine() {
+    local conf=$1 efi=$2 pinned=$3
+    [[ -s /usr/share/limine/BOOTX64.EFI ]] || { iso_die 'The limine package files are missing.'; return 1; }
+    install -m644 /usr/share/limine/BOOTX64.EFI "$efi.new" || return 1
+    if (( pinned )); then
+        limine enroll-config "$efi.new" "$(b2sum -- "$conf.new" | cut -d' ' -f1)" || {
+            rm -f -- "$efi.new"; iso_die 'Could not enroll the Limine config hash.'; return 1
+        }
+    fi
+    mv "$conf.new" "$conf"
+    mv "$efi.new" "$efi"
+    if (( pinned )); then iso_sign_boot_file "$efi"; fi
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then restore_boot_main "$@"; fi
