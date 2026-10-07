@@ -257,6 +257,26 @@ iso_sign_boot_file() {
     return 0
 }
 
+# iso_windows_esp_guid - print the PARTUUID of an EFI system partition that holds the
+# Windows boot manager, if exactly one is found. Strictly read-only: other ESPs are only
+# mounted read-only/noexec for a file check, and the one mounted at /efi is skipped.
+iso_windows_esp_guid() {
+    local esp_type=c12a7328-f81f-11d2-ba4b-00a0c93ec93b own path type guid mnt found=
+    own=$(findmnt -no SOURCE /efi 2>/dev/null || true)
+    mnt=$(mktemp -d) || return 0
+    while read -r path type guid; do
+        [[ ${type,,} == "$esp_type" && -n $guid && $path != "$own" ]] || continue
+        if mount -o ro,noexec,nosuid,nodev "$path" "$mnt" 2>/dev/null; then
+            [[ -f $mnt/EFI/Microsoft/Boot/bootmgfw.efi ]] && found+="$guid"$'\n'
+            umount "$mnt" 2>/dev/null || true
+        fi
+    done < <(lsblk -rno PATH,PARTTYPE,PARTUUID 2>/dev/null)
+    rmdir "$mnt" 2>/dev/null || true
+    # Several Windows ESPs would be ambiguous, so add nothing rather than guess.
+    [[ $(printf '%s' "$found" | grep -c .) == 1 ]] && printf '%s' "$found"
+    return 0
+}
+
 iso_write_pacman_conf() {
     local destination=$1 cache=$2 keyring=$3 server=$4
     # Explicit repositories prevent a Manjaro mirrorlist or CachyOS overrides

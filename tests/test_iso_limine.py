@@ -106,6 +106,7 @@ iso_initramfs_tool() { echo mkinitcpio; }
 iso_kernels() { printf '6.1.0-test\tlinux-test\t%s\n' "$KERNEL_FILE"; }
 iso_sbctl_ready() { [[ ${MOCK_SB:-0} == 1 ]]; }
 iso_sign_boot_file() { echo "sign $1" >> "$MOCK_LOG"; }
+iso_windows_esp_guid() { printf '%s' "${MOCK_WIN:-}"; }
 ''')
         text = RESTORE.read_text().replace('[[ $EUID == 0 ]]', 'true')
         text = re.sub(r'(^|[ "\'=(:])/(efi|boot|etc|usr)(?=[/ "\'\n)]|$)', lambda m: f'{m.group(1)}{self.r}/{m.group(2)}',
@@ -118,7 +119,7 @@ iso_sign_boot_file() { echo "sign $1" >> "$MOCK_LOG"; }
     def boot_conf(self, bootloader):
         (self.r / 'etc/xetal-boot.conf').write_text(f'ROOT_UUID={ROOT_UUID}\nBOOTLOADER={bootloader}\n')
 
-    def run_boot(self, bootloader, sb=False):
+    def run_boot(self, bootloader, sb=False, win=''):
         self.boot_conf(bootloader)
         body = r'''
 source "$1"
@@ -129,7 +130,7 @@ mkinitcpio() { local out i; for ((i = 1; i <= $#; i++)); do [[ ${!i} == -g ]] &&
 limine() { echo "enroll $*" >> "$MOCK_LOG"; printf 'ENROLLED' >> "$2"; }
 restore_boot_main
 '''
-        env = dict(os.environ, MOCK_LOG=str(self.log), MOCK_SB='1' if sb else '0',
+        env = dict(os.environ, MOCK_LOG=str(self.log), MOCK_SB='1' if sb else '0', MOCK_WIN=win,
                    KERNEL_FILE=str(self.r / 'usr/lib/modules/6.1.0-test/vmlinuz'))
         return subprocess.run(['bash', '-c', body, 'test', str(self.script)],
                               capture_output=True, text=True, timeout=30, env=env)
@@ -184,6 +185,26 @@ restore_boot_main
         self.assertEqual(sign, f'sign {self.efi("EFI/BOOT/BOOTX64.EFI")}')
         # the enrolled binary is what ended up at the final path
         self.assertEqual(self.efi('EFI/BOOT/BOOTX64.EFI').read_bytes(), b'LIMINE-BINARYENROLLED')
+
+    WIN_GUID = '1b2c3d4e-0000-4000-8000-aabbccddeeff'
+
+    def test_windows_entry_is_added_unpinned_and_covered_by_the_enrolled_config(self):
+        result = self.run_boot('limine', sb=True, win=self.WIN_GUID)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        conf_path = self.efi('EFI/BOOT/limine.conf')
+        conf = conf_path.read_text()
+        self.assertIn(f'\n/Windows\n    protocol: efi\n    path: guid({self.WIN_GUID}):/EFI/Microsoft/Boot/bootmgfw.efi\n', conf)
+        self.assertNotIn('bootmgfw.efi#', conf)  # Windows updates would stale a pinned hash
+        enroll = self.log.read_text().splitlines()[0]
+        self.assertEqual(enroll.split()[3], b2(conf_path))  # the enrolled hash includes the Windows entry
+
+    def test_no_windows_entry_when_none_found(self):
+        self.assertEqual(self.run_boot('limine').returncode, 0)
+        self.assertNotIn('Windows', self.efi('EFI/BOOT/limine.conf').read_text())
+
+    def test_windows_entry_is_limine_only(self):
+        self.assertEqual(self.run_boot('systemd-boot', win=self.WIN_GUID).returncode, 0)
+        self.assertNotIn('Windows', ''.join(p.read_text() for p in self.efi('loader').rglob('*.conf')))
 
     def test_stale_kernel_copies_are_removed_but_other_files_stay(self):
         (self.efi('Xetal')).mkdir()
@@ -247,6 +268,57 @@ class InstallerWiringTests(unittest.TestCase):
         # bootctl must only be reachable in the final (systemd-boot) else branch
         before_bootctl = text.split('bootctl --esp-path')[0]
         self.assertLess(before_bootctl.rindex("elif [[ $loader == limine ]]"), before_bootctl.rindex('    else\n'))
+
+
+class WindowsDetectionTests(unittest.TestCase):
+    """The real iso_windows_esp_guid with lsblk/findmnt/mount/umount mocked."""
+    ESP = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='iso-win-')
+        self.addCleanup(self.tmp.cleanup)
+        self.t = Path(self.tmp.name)
+
+    def esp(self, name, with_windows):
+        d = self.t / name
+        (d / 'EFI/Microsoft/Boot').mkdir(parents=True)
+        if with_windows:
+            (d / 'EFI/Microsoft/Boot/bootmgfw.efi').write_bytes(b'MZ')
+
+    def detect(self, rows, own='/dev/sda1'):
+        body = r'''
+source @COMMON@
+lsblk() { cat <<'ROWS'
+@ROWS@
+ROWS
+}
+findmnt() { echo @OWN@; }
+mount() { echo "mount $*" >> "$LOG"; local dev=${@: -2:1} mnt=${@: -1}; cp -a "$FAKE/${dev##*/}/." "$mnt"; }
+umount() { echo "umount $*" >> "$LOG"; rm -rf "${1:?}"/*; }
+iso_windows_esp_guid
+'''.replace('@COMMON@', str(COMMON)).replace('@ROWS@', rows).replace('@OWN@', own)
+        env = dict(os.environ, FAKE=str(self.t), LOG=str(self.t / 'log'))
+        (self.t / 'log').write_text('')
+        return subprocess.run(['bash', '-c', body], capture_output=True, text=True, env=env, timeout=30)
+
+    def test_finds_the_other_esp_with_bootmgfw_and_mounts_read_only(self):
+        self.esp('sda1', False); self.esp('nvme0n1p1', True)
+        r = self.detect(f'/dev/sda1 {self.ESP} own-guid\n/dev/nvme0n1p1 {self.ESP} win-guid\n/dev/nvme0n1p3 0fc63daf-8483-4772-8e79-3d69d8477de4 data')
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, 'win-guid'), r.stderr)
+        log = (self.t / 'log').read_text()
+        self.assertIn('ro,noexec,nosuid,nodev /dev/nvme0n1p1', log)
+        self.assertNotIn('/dev/sda1', log)  # our own ESP is never touched
+        self.assertNotIn('/dev/nvme0n1p3', log)  # non-ESP partitions are never mounted
+
+    def test_nothing_found_prints_nothing(self):
+        self.esp('nvme0n1p1', False)
+        r = self.detect(f'/dev/nvme0n1p1 {self.ESP} other-guid')
+        self.assertEqual((r.returncode, r.stdout), (0, ''))
+
+    def test_two_windows_esps_are_ambiguous_so_nothing_is_added(self):
+        self.esp('nvme0n1p1', True); self.esp('nvme1n1p1', True)
+        r = self.detect(f'/dev/nvme0n1p1 {self.ESP} a-guid\n/dev/nvme1n1p1 {self.ESP} b-guid')
+        self.assertEqual((r.returncode, r.stdout), (0, ''))
 
 
 if __name__ == '__main__':

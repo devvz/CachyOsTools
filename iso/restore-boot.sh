@@ -8,7 +8,7 @@ restore_boot_main() {
     source /etc/xetal-boot.conf
     [[ $ROOT_UUID =~ ^[a-fA-F0-9-]+$ ]] || { iso_die 'Invalid root UUID.'; return 1; }
     [[ $BOOTLOADER == grub || $BOOTLOADER == systemd-boot || $BOOTLOADER == limine ]] || return 1
-    local tool kernels version pkgbase kernel image microcode entry entry_tmp config_tmp
+    local tool kernels version pkgbase kernel image microcode entry entry_tmp config_tmp windows_guid
     local limine_conf=/efi/EFI/BOOT/limine.conf limine_efi=/efi/EFI/BOOT/BOOTX64.EFI limine_hash=0
     local -a post_options=()
     tool=$(iso_initramfs_tool /) || return 1
@@ -120,6 +120,13 @@ EOF
         done
     else
         rm "$config_tmp"
+        # Offer Windows if its boot manager is on another ESP. Not hash-pinned: Windows
+        # updates rewrite bootmgfw.efi, which would make a stored hash go stale.
+        windows_guid=$(iso_windows_esp_guid) || windows_guid=
+        if [[ -n $windows_guid ]]; then
+            printf '\n/Windows\n    protocol: efi\n    path: guid(%s):/EFI/Microsoft/Boot/bootmgfw.efi\n' \
+                "$windows_guid" >> "$limine_conf.new"
+        fi
         restore_boot_limine "$limine_conf" "$limine_efi" "$limine_hash" || return 1
         # Remove only our kernel and initramfs copies for kernels that no longer exist.
         for image in /efi/Xetal/vmlinuz-* /efi/Xetal/initramfs-*.img; do
