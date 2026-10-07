@@ -119,14 +119,145 @@ installer_confirm_disk() {
     fi
 }
 
+# Pick one tag from TAG/DESCRIPTION pairs. Prints the tag. dialog when on a TTY,
+# otherwise a numbered-by-tag text prompt (menu text goes to stderr so callers
+# can capture the choice with $(...)).
+installer_menu() {
+    local title=$1 prompt=$2 choice='' i; shift 2
+    local -a items=("$@")
+    if command -v dialog >/dev/null 2>&1 && [[ -t 0 ]]; then
+        choice=$(dialog --stdout --title "$title" --menu "$prompt" 18 78 8 "${items[@]}") || return 1
+    else
+        printf '%s\n' "$prompt" >&2
+        for ((i = 0; i < ${#items[@]}; i += 2)); do printf '  %s  %s\n' "${items[i]}" "${items[i + 1]}" >&2; done
+        read -rp 'Choice: ' choice || return 1
+    fi
+    for ((i = 0; i < ${#items[@]}; i += 2)); do
+        if [[ ${items[i]} == "$choice" ]]; then printf '%s\n' "$choice"; return 0; fi
+    done
+    iso_die 'Invalid selection.'; return 1
+}
+
+installer_choose_mode() {
+    installer_menu 'Installation target' 'Where should the cloned system be installed?' \
+        wipe  'Erase a whole disk (original behaviour)' \
+        free  'Use FREE SPACE on a disk (existing partitions are kept)' \
+        parts 'Use two EXISTING partitions I prepared (ROOT + EFI)'
+}
+
+# Free-space mode. Sets SEL_DISK, SEL_START and SEL_END (MiB, END exclusive).
+installer_select_free() {
+    local protected=$1 bytes=$2 disk start end n=0 idx
+    local -a d_disk=() d_start=() d_end=() items=()
+    SEL_DISK=''; SEL_START=''; SEL_END=''
+    while read -r disk; do
+        [[ -n $disk ]] || continue
+        iso_validate_disk "$disk" "$protected" >/dev/null 2>&1 || continue
+        [[ $(iso_gpt_table "$disk") == gpt ]] || continue
+        while IFS=$'\t' read -r start end; do
+            [[ -n $start ]] || continue
+            d_disk+=("$disk"); d_start+=("$start"); d_end+=("$end")
+            items+=("$n" "$disk $(lsblk -dnro SIZE "$disk") - free $(((end - start) / 1024)) GiB at offset $((start / 1024)) GiB")
+            n=$((n + 1))
+        done < <(iso_free_regions "$disk" "$bytes")
+    done < <(lsblk -dpnro NAME,TYPE | awk '$2 == "disk" {print $1}')
+    (( n )) || {
+        iso_die "No GPT disk has a free region of at least $((bytes / 1024 / 1024 / 1024 + 1)) GiB. Shrink a partition first (for example in Windows Disk Management). No disk has been changed."
+        return 1
+    }
+    if (( n == 1 )); then
+        idx=0
+    else
+        idx=$(installer_menu 'Select free space' 'Install into which free region? Existing partitions are not modified.' "${items[@]}") || return 1
+    fi
+    SEL_DISK=${d_disk[idx]}; SEL_START=${d_start[idx]}; SEL_END=${d_end[idx]}
+}
+
+# Existing-partition mode. Sets SEL_ROOT, SEL_ESP and SEL_DISK (the root's disk).
+installer_select_parts() {
+    local protected=$1 root_need=$2 esp_need=$3 part size
+    local -a roots=() esps=()
+    SEL_DISK=''; SEL_ROOT=''; SEL_ESP=''
+    while read -r part; do
+        [[ -n $part ]] || continue
+        iso_validate_partition "$part" "$protected" >/dev/null 2>&1 || continue
+        size=$(lsblk -bdnro SIZE "$part")
+        [[ $size =~ ^[0-9]+$ ]] || continue
+        if (( size >= root_need )); then roots+=("$part" "$(lsblk -dnro SIZE,FSTYPE,LABEL "$part")"); fi
+        if (( size >= esp_need )); then esps+=("$part" "$(lsblk -dnro SIZE,FSTYPE,LABEL "$part")"); fi
+    done < <(lsblk -pnro NAME,TYPE | awk '$2 == "part" {print $1}')
+    (( ${#roots[@]} )) || {
+        iso_die "No unused partition is large enough for the root filesystem (needs $((root_need / 1024 / 1024 / 1024 + 1)) GiB). No disk has been changed."
+        return 1
+    }
+    SEL_ROOT=$(installer_menu 'Select ROOT partition (will be ERASED)' \
+        'The cloned system is restored into this partition. Everything on it is lost.' "${roots[@]}") || return 1
+    local -a esps_left=()
+    local i
+    for ((i = 0; i < ${#esps[@]}; i += 2)); do
+        [[ ${esps[i]} == "$SEL_ROOT" ]] || esps_left+=("${esps[i]}" "${esps[i + 1]}")
+    done
+    (( ${#esps_left[@]} )) || {
+        iso_die "No second unused partition of at least $((esp_need / 1024 / 1024)) MiB for the EFI system partition. Do NOT reuse your Windows EFI partition. No disk has been changed."
+        return 1
+    }
+    SEL_ESP=$(installer_menu 'Select EFI partition (will be FORMATTED)' \
+        'Formatted as FAT32. Never pick the EFI partition Windows boots from.' "${esps_left[@]}") || return 1
+    SEL_ROOT=$(readlink -f -- "$SEL_ROOT"); SEL_ESP=$(readlink -f -- "$SEL_ESP")
+    iso_validate_partition "$SEL_ROOT" "$protected" || return 1
+    iso_validate_partition "$SEL_ESP" "$protected" || return 1
+    SEL_DISK=$(iso_disk_ancestors "$SEL_ROOT" | head -n 1)
+}
+
+# What must stay identical between selection and the first write.
+installer_target_identity() {
+    case $1 in
+        parts) lsblk -dnro MAJ:MIN,PARTUUID,SIZE "$SEL_ROOT" "$SEL_ESP" ;;
+        *) lsblk -dnro MAJ:MIN,SERIAL,WWN "$2" ;;
+    esac
+}
+
+# Confirmation for the free-space and existing-partition modes. Extra arguments
+# are partitions that already hold a filesystem; each must be typed back.
+installer_confirm_plan() {
+    local summary=$1 danger=$2 back='XETAL ENGINE - System Installer' reply path; shift 2
+    if command -v dialog >/dev/null 2>&1 && [[ -t 0 ]]; then
+        dialog --backtitle "$back" --cr-wrap --no-collapse --defaultno --title ' Confirm Plan ' \
+            --yesno "$summary" 22 76 || { clear; echo 'Installation cancelled.'; return 1; }
+        for path in "$@"; do
+            reply=$(dialog --stdout --backtitle "$back" --title ' Existing data detected ' \
+                --inputbox "$path already contains a filesystem.\nType its path to confirm it may be erased:" 10 70) \
+                || { clear; echo 'Installation cancelled.'; return 1; }
+            [[ $reply == "$path" ]] || { clear; echo 'Installation cancelled.'; return 1; }
+        done
+        dialog --backtitle "$back" --cr-wrap --no-collapse --defaultno --title ' FINAL WARNING ' \
+            --yesno "$danger" 9 66 || { clear; echo 'Installation cancelled.'; return 1; }
+        clear
+    else
+        printf '%s\n\n' "$summary"
+        printf "\033[33mType 'INSTALL' to confirm: \033[0m\n"
+        read -r reply || return 1
+        [[ $reply == INSTALL ]] || { printf '\033[31mAborted.\033[0m\n'; return 1; }
+        for path in "$@"; do
+            printf '%s already contains a filesystem. Type its path to confirm it may be erased:\n' "$path"
+            read -r reply || return 1
+            [[ $reply == "$path" ]] || { printf '\033[31mAborted.\033[0m\n'; return 1; }
+        done
+    fi
+}
+
 installer_main() {
     source /opt/clone/common.sh
     [[ $EUID == 0 ]] || { iso_die 'Run the installer as root from the live ISO.'; return 1; }
     installer_show_logo
     local tool mode uefi=0 disk='' protected identity bytes capacity esp_mib root_uuid loader
     local key value source_bytes='' supports_uefi=0 supports_bios=0 kernel_count=1 format='' arch=''
+    local install_mode=wipe dry_run=0 plan='' esp_num root_num summary='' danger='' part
+    local -a typed=()
+    # --dry-run: choose and validate a target, print the plan, change nothing.
+    [[ ${1:-} != --dry-run ]] || dry_run=1
     for tool in lsblk findmnt losetup swapon mountpoint parted partprobe udevadm mkfs.fat mkfs.ext4 \
-        mount umount genfstab arch-chroot tar zstd sha256sum blkid file; do iso_need "$tool" 'live ISO installer' || return 1; done
+        mount umount genfstab arch-chroot tar zstd sha256sum blkid file wipefs; do iso_need "$tool" 'live ISO installer' || return 1; done
     [[ -r /opt/clone/snapshot.meta && -r /opt/clone/snapshot.sha256 ]] || {
         iso_die 'This ISO has no verified snapshot manifest. Rebuild it with a current creator.'; return 1;
     }
@@ -154,58 +285,141 @@ installer_main() {
         [[ $supports_bios == 1 ]] || { iso_die 'This snapshot requires UEFI. Reboot the USB in UEFI mode; no disk has been changed.'; return 1; }
     fi
     protected=$(installer_protected_disks) || return 1
-    echo '[*] Verifying the complete snapshot before selecting a target...'
-    (cd /opt/clone && sha256sum --check --strict snapshot.sha256) || return 1
+    if (( dry_run )); then
+        echo '[dry-run] Skipping snapshot verification; nothing will be written.'
+    else
+        echo '[*] Verifying the complete snapshot before selecting a target...'
+        (cd /opt/clone && sha256sum --check --strict snapshot.sha256) || return 1
+    fi
     esp_mib=$((kernel_count * 512))
     (( esp_mib >= 2048 )) || esp_mib=2048
     bytes=$((source_bytes + source_bytes / 5 + (esp_mib + 1024) * 1024 * 1024))
 
-    local -a items=()
-    while read -r value; do
-        [[ -n $value ]] || continue
-        if iso_validate_disk "$value" "$protected" >/dev/null 2>&1; then
-            items+=("$value" "$(lsblk -dnro SIZE,MODEL "$value")")
-        fi
-    done < <(lsblk -dpnro NAME,TYPE | awk '$2 == "disk" {print $1}')
-    (( ${#items[@]} )) || { iso_die 'No unused writable target disks were found.'; return 1; }
-    echo 'The target disk will be erased and recreated as unencrypted ext4 plus an EFI partition.'
-    echo 'Source encryption, Btrfs snapshots, partition layout and bootloader configuration are not preserved.'
-    if command -v dialog >/dev/null 2>&1 && [[ -t 0 ]]; then
-        disk=$(dialog --stdout --title 'Select disk to ERASE' --menu \
-            'Restore to a new unencrypted ext4 filesystem. All target data will be lost.' 18 78 8 "${items[@]}") || return 1
-    else
-        printf '%s\n' "${items[@]}"
-        read -rp 'Whole target disk (for example /dev/sda): ' disk
+    install_mode=$(installer_choose_mode) || return 1
+    if [[ $install_mode != wipe ]] && (( ! uefi )); then
+        iso_die 'Free-space and existing-partition installs need the USB booted in UEFI mode. No disk has been changed.'; return 1
     fi
-    disk=$(readlink -f -- "$disk")
-    iso_validate_disk "$disk" "$protected" || return 1
-    capacity=$(lsblk -bdnro SIZE "$disk")
-    [[ $capacity =~ ^[0-9]+$ ]] && (( capacity >= bytes )) || {
-        iso_die "The target needs at least $((bytes / 1024 / 1024 / 1024 + 1)) GiB for this snapshot."; return 1;
-    }
-    identity=$(lsblk -dnro MAJ:MIN,SERIAL,WWN "$disk")
-    installer_confirm_disk "$disk" || return 1
+    case $install_mode in
+    wipe)
+        local -a items=()
+        while read -r value; do
+            [[ -n $value ]] || continue
+            if iso_validate_disk "$value" "$protected" >/dev/null 2>&1; then
+                items+=("$value" "$(lsblk -dnro SIZE,MODEL "$value")")
+            fi
+        done < <(lsblk -dpnro NAME,TYPE | awk '$2 == "disk" {print $1}')
+        (( ${#items[@]} )) || { iso_die 'No unused writable target disks were found.'; return 1; }
+        echo 'The target disk will be erased and recreated as unencrypted ext4 plus an EFI partition.'
+        echo 'Source encryption, Btrfs snapshots, partition layout and bootloader configuration are not preserved.'
+        if command -v dialog >/dev/null 2>&1 && [[ -t 0 ]]; then
+            disk=$(dialog --stdout --title 'Select disk to ERASE' --menu \
+                'Restore to a new unencrypted ext4 filesystem. All target data will be lost.' 18 78 8 "${items[@]}") || return 1
+        else
+            printf '%s\n' "${items[@]}"
+            read -rp 'Whole target disk (for example /dev/sda): ' disk
+        fi
+        disk=$(readlink -f -- "$disk")
+        iso_validate_disk "$disk" "$protected" || return 1
+        capacity=$(lsblk -bdnro SIZE "$disk")
+        [[ $capacity =~ ^[0-9]+$ ]] && (( capacity >= bytes )) || {
+            iso_die "The target needs at least $((bytes / 1024 / 1024 / 1024 + 1)) GiB for this snapshot."; return 1;
+        }
+        summary="Whole-disk install to $disk. EVERYTHING on that disk will be erased."
+        ;;
+    free)
+        echo 'The cloned system will be installed into free space; existing partitions are not modified.'
+        installer_select_free "$protected" "$bytes" || return 1
+        disk=$SEL_DISK
+        summary="Install the cloned system into FREE SPACE:"$'\n\n'
+        summary+="  Disk:               $disk ($(lsblk -dno SIZE,MODEL "$disk" | sed 's/  */ /g'))"$'\n'
+        summary+="  Free region:        $(((SEL_END - SEL_START) / 1024)) GiB, starting at $SEL_START MiB"$'\n'
+        summary+="  New EFI partition:  $esp_mib MiB (FAT32)"$'\n'
+        summary+="  New root partition: $(((SEL_END - SEL_START - esp_mib) / 1024)) GiB (ext4)"$'\n\n'
+        summary+='Existing partitions (Windows etc.) are NOT modified. Only two new'$'\n'
+        summary+='partition table entries are written, inside the free region above.'$'\n'
+        summary+='Secure Boot must stay disabled to boot the restored system.'
+        danger="Create the two new partitions on $disk now and install the cloned system into them?"
+        ;;
+    parts)
+        echo 'The two partitions you pick will be formatted; no other partition is touched.'
+        installer_select_parts "$protected" "$((bytes - esp_mib * 1024 * 1024))" "$((esp_mib * 1024 * 1024))" || return 1
+        disk=$SEL_DISK
+        summary="Install the cloned system into EXISTING partitions:"$'\n\n'
+        summary+="  ROOT (ext4):  $SEL_ROOT  ($(lsblk -dno SIZE,FSTYPE,LABEL "$SEL_ROOT" | sed 's/  */ /g'))"$'\n'
+        summary+="  EFI  (FAT32): $SEL_ESP  ($(lsblk -dno SIZE,FSTYPE,LABEL "$SEL_ESP" | sed 's/  */ /g'))"$'\n\n'
+        summary+='Both partitions will be FORMATTED: their contents are permanently erased.'$'\n'
+        summary+='No other partition is modified. Secure Boot must stay disabled.'
+        danger="LAST CHANCE: erase $SEL_ROOT and $SEL_ESP and install the cloned system?"
+        for part in "$SEL_ROOT" "$SEL_ESP"; do
+            if [[ -n $(blkid -p -o value -s TYPE "$part" 2>/dev/null) ]]; then typed+=("$part"); fi
+        done
+        ;;
+    esac
+    if (( dry_run )); then
+        printf '\n[dry-run] Plan:\n%s\n\n[dry-run] No changes were made.\n' "$summary"
+        return 0
+    fi
+    identity=$(installer_target_identity "$install_mode" "$disk")
+    if [[ $install_mode == wipe ]]; then
+        installer_confirm_disk "$disk" || return 1
+    else
+        installer_confirm_plan "$summary" "$danger" "${typed[@]}" || return 1
+    fi
     installer_show_logo
     # Revalidate after the interactive pause, immediately before destructive work.
-    [[ $identity == "$(lsblk -dnro MAJ:MIN,SERIAL,WWN "$disk")" ]] || { iso_die 'The selected device changed.'; return 1; }
-    iso_validate_disk "$disk" "$protected" || return 1
+    [[ $identity == "$(installer_target_identity "$install_mode" "$disk")" ]] || { iso_die 'The selected device changed.'; return 1; }
+    if [[ $install_mode == parts ]]; then
+        iso_validate_partition "$SEL_ROOT" "$protected" || return 1
+        iso_validate_partition "$SEL_ESP" "$protected" || return 1
+    else
+        iso_validate_disk "$disk" "$protected" || return 1
+    fi
+    if [[ $install_mode == free ]]; then
+        # The chosen region must still be free and large enough.
+        local region_ok=0 rs re
+        while IFS=$'\t' read -r rs re; do
+            [[ -n $rs ]] || continue
+            if (( rs <= SEL_START && re >= SEL_END )); then region_ok=1; fi
+        done < <(iso_free_regions "$disk" "$bytes")
+        (( region_ok )) || { iso_die 'The free region changed since it was selected. Nothing was written.'; return 1; }
+    fi
     TARGET=$(mktemp -d /mnt/xetal-install-XXXXXX)
     trap installer_cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     exec > >(tee -a /var/log/xetal-installer.log) 2>&1
 
-    echo '[1/6] Partitioning the confirmed disk...'
-    parted -s "$disk" mklabel gpt
-    parted -s "$disk" mkpart BIOS 1MiB 3MiB
-    parted -s "$disk" set 1 bios_grub on
-    parted -s "$disk" mkpart ESP fat32 3MiB "$((esp_mib + 3))MiB"
-    parted -s "$disk" set 2 esp on
-    parted -s "$disk" mkpart ROOT ext4 "$((esp_mib + 3))MiB" 100%
-    partprobe "$disk"
-    udevadm settle --timeout=30
     local esp root_device
-    esp=$(iso_partition_path "$disk" 2); root_device=$(iso_partition_path "$disk" 3)
+    case $install_mode in
+    wipe)
+        echo '[1/6] Partitioning the confirmed disk...'
+        parted -s "$disk" mklabel gpt
+        parted -s "$disk" mkpart BIOS 1MiB 3MiB
+        parted -s "$disk" set 1 bios_grub on
+        parted -s "$disk" mkpart ESP fat32 3MiB "$((esp_mib + 3))MiB"
+        parted -s "$disk" set 2 esp on
+        parted -s "$disk" mkpart ROOT ext4 "$((esp_mib + 3))MiB" 100%
+        partprobe "$disk"
+        udevadm settle --timeout=30
+        esp=$(iso_partition_path "$disk" 2); root_device=$(iso_partition_path "$disk" 3)
+        ;;
+    free)
+        echo '[1/6] Creating partitions in the selected free space...'
+        plan=$(iso_create_efi_root "$disk" "$SEL_START" "$esp_mib" "$SEL_END") || return 1
+        read -r esp_num root_num <<< "$plan"
+        partprobe "$disk"
+        udevadm settle --timeout=30
+        esp=$(iso_partition_path "$disk" "$esp_num"); root_device=$(iso_partition_path "$disk" "$root_num")
+        [[ -b $esp && -b $root_device ]] || { iso_die 'New partitions did not appear.'; return 1; }
+        # Free space may hold leftovers of an old filesystem; clear stale signatures.
+        wipefs -a -- "$esp" "$root_device"
+        ;;
+    parts)
+        echo '[1/6] Using the selected existing partitions...'
+        esp=$SEL_ESP; root_device=$SEL_ROOT
+        wipefs -a -- "$esp" "$root_device"
+        ;;
+    esac
     [[ -b $esp && -b $root_device ]] || { iso_die 'New partitions did not appear.'; return 1; }
     echo '[2/6] Formatting...'
     mkfs.fat -F32 "$esp"
@@ -276,6 +490,11 @@ HOOK
     fi
     sync
     umount -R "$TARGET"
+    if [[ $install_mode != wipe ]]; then
+        echo "[i] The restored system boots from its own EFI partition ($esp)."
+        echo '[i] Other operating systems were not touched. Choose the new entry from your firmware boot menu (often F12, F8 or Esc).'
+        echo '[i] Secure Boot has to remain disabled for this unsigned bootloader.'
+    fi
     echo '[6/6] Installation complete. Remove the USB and reboot when ready.'
 }
 

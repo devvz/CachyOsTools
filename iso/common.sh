@@ -116,6 +116,100 @@ iso_validate_disk() {
     done <<< "$swaps"
 }
 
+# ---------------------------------------------------------------------------
+# Partition-aware install helpers (free space / existing partitions).
+# All of these only READ the disk except iso_create_efi_root, which creates two
+# new partitions strictly inside a free region and verifies that every
+# pre-existing partition is byte-for-byte unchanged afterwards.
+# ---------------------------------------------------------------------------
+
+# Prints the partition table type of a disk (gpt, msdos, loop, or nothing).
+iso_gpt_table() {
+    parted -m -s "$1" unit B print 2>/dev/null | awk -F: 'NR == 2 {print $6}'
+}
+
+# One line per existing partition: NUMBER<TAB>START<TAB>END<TAB>SIZE (bytes).
+iso_partition_rows() {
+    local out
+    out=$(parted -m -s "$1" unit B print 2>/dev/null) || return 1
+    awk -F: 'NR > 2 && $1 ~ /^[0-9]+$/ && $5 !~ /^free;?$/ {
+        gsub(/B/, "", $2); gsub(/B/, "", $3); gsub(/B/, "", $4)
+        print $1 "\t" $2 "\t" $3 "\t" $4 }' <<< "$out"
+}
+
+# Partition number of the partition starting at the given byte offset.
+iso_partition_at() {
+    iso_partition_rows "$1" | awk -F'\t' -v s="$2" '$2 == s {print $1; found = 1} END {exit !found}'
+}
+
+# Free regions of at least MIN_BYTES, as START_MIB<TAB>END_MIB (END exclusive).
+# Start is rounded up and end rounded down to whole MiB so new partitions are
+# always 1 MiB aligned and can never spill into a neighbouring partition.
+iso_free_regions() {
+    local disk=$1 min_bytes=$2 mib=1048576 out start end s e
+    out=$(parted -m -s "$disk" unit B print free 2>/dev/null) || return 1
+    while IFS=$'\t' read -r start end; do
+        [[ $start =~ ^[0-9]+$ && $end =~ ^[0-9]+$ ]] || continue
+        s=$(((start + mib - 1) / mib)); e=$(((end + 1) / mib))
+        (( s > 0 && (e - s) * mib >= min_bytes )) || continue
+        printf '%s\t%s\n' "$s" "$e"
+    done < <(awk -F: 'NR > 2 && $5 ~ /^free;?$/ {
+        gsub(/B/, "", $2); gsub(/B/, "", $3); print $2 "\t" $3 }' <<< "$out")
+}
+
+# Create an EFI partition (ESP_MIB) followed by a root partition filling the rest
+# of [START_MIB, END_MIB). Prints "ESP_NUMBER ROOT_NUMBER" on success.
+iso_create_efi_root() {
+    local disk=$1 start=$2 esp_mib=$3 end=$4 mib=1048576
+    local mid before after esp_num root_num n s e z
+    [[ $start =~ ^[0-9]+$ && $esp_mib =~ ^[0-9]+$ && $end =~ ^[0-9]+$ ]] &&
+        (( start > 0 && esp_mib > 0 && end > start + esp_mib )) || {
+        iso_die 'Invalid partition plan.'; return 1;
+    }
+    mid=$((start + esp_mib))
+    before=$(iso_partition_rows "$disk") || { iso_die 'Cannot read the partition table.'; return 1; }
+    parted -s "$disk" mkpart ESP fat32 "${start}MiB" "${mid}MiB" >/dev/null || return 1
+    esp_num=$(iso_partition_at "$disk" $((start * mib))) || { iso_die 'The new EFI partition was not found.'; return 1; }
+    parted -s "$disk" set "$esp_num" esp on >/dev/null || return 1
+    parted -s "$disk" mkpart ROOT ext4 "${mid}MiB" "${end}MiB" >/dev/null || return 1
+    root_num=$(iso_partition_at "$disk" $((mid * mib))) || { iso_die 'The new root partition was not found.'; return 1; }
+    after=$(iso_partition_rows "$disk") || return 1
+    # Post-condition: nothing that existed before may have moved or resized.
+    while IFS=$'\t' read -r n s e z; do
+        [[ -n $n ]] || continue
+        grep -qxF -- "$n"$'\t'"$s"$'\t'"$e"$'\t'"$z" <<< "$after" || {
+            iso_die "Existing partition $n was modified. Aborting before formatting anything."; return 1;
+        }
+    done <<< "$before"
+    printf '%s %s\n' "$esp_num" "$root_num"
+}
+
+# Like iso_validate_disk, but for a single partition that will be formatted.
+iso_validate_partition() {
+    local part=$1 protected=$2 line _name type pdisk swap swaps children mounted
+    if ! iso_is_block "$part" || [[ $(lsblk -dnro TYPE "$part") != part || $(lsblk -dnro RO "$part") != 0 ]]; then
+        iso_die 'Select a writable partition.'; return 1
+    fi
+    pdisk=$(iso_disk_ancestors "$part") || return 1
+    [[ -n $pdisk ]] || { iso_die 'Cannot identify the disk of that partition.'; return 1; }
+    while IFS= read -r line; do
+        [[ -z $line ]] || [[ $pdisk != "$line" ]] || {
+            iso_die 'That partition is on the running system or installation medium.'; return 1;
+        }
+    done <<< "$protected"
+    mounted=$(lsblk -nrpo MOUNTPOINTS "$part") || return 1
+    [[ -z ${mounted//[[:space:]]/} ]] || { iso_die "$part is mounted or in use as swap."; return 1; }
+    children=$(lsblk -nrpo NAME,TYPE "$part") || return 1
+    while read -r _name type; do
+        [[ -z $type || $type == part ]] || { iso_die "$part is in use by a mapper, RAID or LVM device."; return 1; }
+    done <<< "$children"
+    swaps=$(swapon --noheadings --raw --show=NAME) || return 1
+    while read -r swap; do
+        [[ -n $swap ]] || continue
+        [[ $swap != "$part" ]] || { iso_die "$part is active swap."; return 1; }
+    done <<< "$swaps"
+}
+
 iso_unmount_tree() {
     local root=$1 encoded path failed=0
     # /proc encodes spaces and backslashes. Decode before comparing or unmounting.
