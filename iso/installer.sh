@@ -478,15 +478,40 @@ HOOK
     rm -f "$TARGET/var/lib/systemd/random-seed"
     echo '[5/6] Regenerating boot files for the restored system...'
     arch-chroot "$TARGET" /usr/local/sbin/xetal-update-boot
+    # Secure Boot: only when the restored system carries sbctl and its keys.
+    local sb_sign=0 sb_file
+    if (( uefi )) && iso_sbctl_ready "$TARGET"; then sb_sign=1; fi
     if [[ $loader == grub ]]; then
         if (( uefi )); then
+            local -a grub_sb=()
+            # A shim-less GRUB needs these to boot signed kernels under Secure Boot.
+            if (( sb_sign )); then grub_sb=(--modules=tpm --disable-shim-lock); fi
             # The removable path works without writable EFI NVRAM variables.
-            arch-chroot "$TARGET" grub-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=XetalClone --removable --no-nvram
+            arch-chroot "$TARGET" grub-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=XetalClone --removable --no-nvram "${grub_sb[@]}"
+            if (( sb_sign )); then
+                arch-chroot "$TARGET" sbctl sign -s /efi/EFI/BOOT/BOOTX64.EFI ||
+                    echo '[WARN] Could not sign the GRUB binary; sign it later with: sbctl sign -s /efi/EFI/BOOT/BOOTX64.EFI'
+            fi
         else
             arch-chroot "$TARGET" grub-install --target=i386-pc "$disk"
         fi
     else
+        if (( sb_sign )); then
+            # bootctl prefers the .signed variant, so later bootctl updates stay signed too.
+            arch-chroot "$TARGET" sbctl sign -s -o /usr/lib/systemd/boot/efi/systemd-bootx64.efi.signed \
+                /usr/lib/systemd/boot/efi/systemd-bootx64.efi || echo '[WARN] Could not sign systemd-boot for Secure Boot.'
+        fi
         arch-chroot "$TARGET" bootctl --esp-path=/efi --no-variables install
+        if (( sb_sign )); then
+            # Belt and braces: make sure the copies on the EFI partition are signed.
+            for sb_file in /efi/EFI/systemd/systemd-bootx64.efi /efi/EFI/BOOT/BOOTX64.EFI; do
+                arch-chroot "$TARGET" sbctl sign -s "$sb_file" || echo "[WARN] Could not sign $sb_file."
+            done
+        fi
+    fi
+    if (( sb_sign )); then
+        echo '[i] Secure Boot: boot files were signed with the sbctl keys found in the restored system.'
+        echo '[i] Enable Secure Boot in firmware only after confirming the keys are enrolled (sbctl status).'
     fi
     sync
     umount -R "$TARGET"

@@ -221,6 +221,26 @@ iso_unmount_tree() {
     (( failed == 0 )) || iso_die "Could not unmount $root; it has been preserved."
 }
 
+# ---------------------------------------------------------------------------
+# Secure Boot support (sbctl). Entirely optional and best effort: it only does
+# anything when sbctl and its signing keys exist in the restored system, and a
+# signing failure only prints a warning. It can never make an install fail.
+# ---------------------------------------------------------------------------
+
+# iso_sbctl_ready [ROOT] - true if ROOT (default /) has sbctl and a db signing key.
+iso_sbctl_ready() {
+    local root=${1:-}
+    [[ -x $root/usr/bin/sbctl ]] &&
+        { [[ -r $root/var/lib/sbctl/keys/db/db.key ]] || [[ -r $root/usr/share/secureboot/keys/db/db.key ]]; }
+}
+
+# iso_sign_boot_file FILE - sign FILE in place (and remember it in sbctl's database).
+iso_sign_boot_file() {
+    iso_sbctl_ready || return 0
+    sbctl sign -s "$1" >/dev/null || printf '[WARN] Could not sign %s for Secure Boot.\n' "$1" >&2
+    return 0
+}
+
 iso_write_pacman_conf() {
     local destination=$1 cache=$2 keyring=$3 server=$4
     # Explicit repositories prevent a Manjaro mirrorlist or CachyOS overrides

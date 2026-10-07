@@ -46,6 +46,8 @@ EOF
         [[ -s $image.new ]] || { iso_die "No initramfs was produced for $version."; return 1; }
         mv "$image.new" "$image"
         cp "$kernel" "/boot/xetal/vmlinuz-$version"
+        # GRUB loads this copy. A fresh copy is unsigned, so sign it again (Secure Boot).
+        if [[ $BOOTLOADER == grub ]]; then iso_sign_boot_file "/boot/xetal/vmlinuz-$version"; fi
         {
             printf "menuentry 'Cloned system - %s' {\n" "$pkgbase"
             printf "  search --no-floppy --fs-uuid --set=root %s\n" "$ROOT_UUID"
@@ -58,6 +60,7 @@ EOF
         } >> "$config_tmp"
         if [[ $BOOTLOADER == systemd-boot ]]; then
             cp "/boot/xetal/vmlinuz-$version" "/efi/Xetal/vmlinuz-$version"
+            iso_sign_boot_file "/efi/Xetal/vmlinuz-$version"
             cp "$image" "/efi/Xetal/initramfs-$version.img"
             entry="/efi/loader/entries/xetal-$version.conf"
             entry_tmp="$entry.new"

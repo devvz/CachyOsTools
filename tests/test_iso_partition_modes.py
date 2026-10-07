@@ -380,6 +380,77 @@ installer_main --dry-run
         self.assertIn('Invalid selection', result.stderr)
 
 
+class SecureBootTests(unittest.TestCase):
+    """Optional sbctl signing: only with keys present, and never fatal."""
+
+    def sh(self, body):
+        code = f'source "$1"\n{body}'
+        return subprocess.run(['bash', '-c', code, 'test', str(COMMON)],
+                              capture_output=True, text=True, timeout=10)
+
+    def make_root(self, sbctl=True, keys='/var/lib/sbctl/keys/db/db.key'):
+        tmp = tempfile.TemporaryDirectory(prefix='iso-sb-')
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        if sbctl:
+            (root / 'usr/bin').mkdir(parents=True)
+            (root / 'usr/bin/sbctl').write_text('#!/bin/sh\n')
+            (root / 'usr/bin/sbctl').chmod(0o755)
+        if keys:
+            key = root / keys.lstrip('/')
+            key.parent.mkdir(parents=True)
+            key.write_text('key')
+        return root
+
+    def test_ready_needs_both_sbctl_and_a_signing_key(self):
+        cases = [(dict(), 0), (dict(sbctl=False), 1), (dict(keys=None), 1),
+                 (dict(keys='/usr/share/secureboot/keys/db/db.key'), 0)]
+        for kwargs, expected in cases:
+            with self.subTest(**kwargs):
+                root = self.make_root(**kwargs)
+                self.assertEqual(self.sh(f'iso_sbctl_ready "{root}"').returncode, expected)
+
+    def test_signing_calls_sbctl_when_ready(self):
+        result = self.sh('iso_sbctl_ready() { return 0; }\n'
+                         'sbctl() { echo "sbctl $*"; }\n'
+                         'iso_sign_boot_file /efi/Xetal/vmlinuz-6.1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # sbctl's own output is hidden; only the call matters here.
+        result = self.sh('iso_sbctl_ready() { return 0; }\n'
+                         'sbctl() { echo "$*" >> "$LOG"; }\n'
+                         'LOG=$(mktemp); iso_sign_boot_file /efi/Xetal/vmlinuz-6.1; cat "$LOG"')
+        self.assertEqual(result.stdout.strip(), 'sign -s /efi/Xetal/vmlinuz-6.1')
+
+    def test_signing_failure_only_warns(self):
+        result = self.sh('iso_sbctl_ready() { return 0; }\nsbctl() { return 1; }\n'
+                         'iso_sign_boot_file /boot/xetal/vmlinuz-6.1')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('[WARN] Could not sign /boot/xetal/vmlinuz-6.1', result.stderr)
+
+    def test_nothing_is_signed_without_keys(self):
+        result = self.sh('iso_sbctl_ready() { return 1; }\nsbctl() { echo CALLED; }\n'
+                         'iso_sign_boot_file /efi/x')
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+
+    def test_kernel_copies_are_signed_for_the_loader_that_reads_them(self):
+        text = (REPO / 'iso/restore-boot.sh').read_text()
+        self.assertIn('if [[ $BOOTLOADER == grub ]]; then iso_sign_boot_file "/boot/xetal/vmlinuz-$version"; fi', text)
+        sd_boot = text.index('if [[ $BOOTLOADER == systemd-boot ]]; then\n            cp "/boot/xetal')
+        self.assertLess(sd_boot, text.index('iso_sign_boot_file "/efi/Xetal/vmlinuz-$version"'))
+
+    def test_grub_flags_are_only_added_when_signing_is_active(self):
+        text = INSTALLER.read_text()
+        self.assertIn('local -a grub_sb=()', text)
+        self.assertIn('if (( sb_sign )); then grub_sb=(--modules=tpm --disable-shim-lock); fi', text)
+        self.assertIn('--removable --no-nvram "${grub_sb[@]}"', text)
+        self.assertEqual(text.count('--disable-shim-lock'), 1)
+        self.assertIn('if (( uefi )) && iso_sbctl_ready "$TARGET"; then sb_sign=1; fi', text)
+
+    def test_installer_still_refuses_to_run_with_secure_boot_enabled(self):
+        self.assertIn('Disable Secure Boot before restoring', INSTALLER.read_text())
+
+
 class WipeModeUnchangedTests(unittest.TestCase):
     def test_whole_disk_partitioning_commands_are_still_present_verbatim(self):
         text = INSTALLER.read_text()
