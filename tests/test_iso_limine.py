@@ -186,6 +186,24 @@ restore_boot_main
         # the enrolled binary is what ended up at the final path
         self.assertEqual(self.efi('EFI/BOOT/BOOTX64.EFI').read_bytes(), b'LIMINE-BINARYENROLLED')
 
+    # ---- early GPU modules (an NVIDIA system needs its driver in the initramfs) --------
+    def test_gpu_modules_listed_by_the_source_are_kept_and_layout_modules_dropped(self):
+        (self.r / 'etc/mkinitcpio.conf.d').mkdir()
+        (self.r / 'etc/mkinitcpio.conf').write_text('MODULES=(btrfs)\nHOOKS=(base udev)\n')
+        (self.r / 'etc/mkinitcpio.conf.d/10-nvidia.conf').write_text(
+            'MODULES+=(nvidia nvidia_modeset nvidia_uvm nvidia_drm dm_crypt nvidia)\nHOOKS+=(sd-btrfs-overlayfs)\n')
+        result = self.run_boot('limine')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        conf = (self.r / 'etc/mkinitcpio-xetal.conf').read_text().splitlines()
+        self.assertEqual(conf[0], 'MODULES=(ext4 nvidia nvidia_modeset nvidia_uvm nvidia_drm)')
+        self.assertIn('HOOKS=(base udev modconf keyboard block filesystems fsck)', conf)  # hooks untouched
+
+    def test_without_source_gpu_modules_the_initramfs_config_is_unchanged(self):
+        self.assertEqual(self.run_boot('limine').returncode, 0)
+        conf = (self.r / 'etc/mkinitcpio-xetal.conf').read_text()
+        self.assertEqual(conf, 'MODULES=(ext4)\nBINARIES=()\nFILES=()\n'
+                               'HOOKS=(base udev modconf keyboard block filesystems fsck)\nCOMPRESSION="gzip"\n')
+
     WIN_GUID = '1b2c3d4e-0000-4000-8000-aabbccddeeff'
 
     def test_windows_entry_is_added_unpinned_and_covered_by_the_enrolled_config(self):
@@ -268,6 +286,28 @@ class InstallerWiringTests(unittest.TestCase):
         # bootctl must only be reachable in the final (systemd-boot) else branch
         before_bootctl = text.split('bootctl --esp-path')[0]
         self.assertLess(before_bootctl.rindex("elif [[ $loader == limine ]]"), before_bootctl.rindex('    else\n'))
+
+
+class NoSignSwitchTests(unittest.TestCase):
+    def ready(self, no_sign):
+        with tempfile.TemporaryDirectory(prefix='iso-nosign-') as d:
+            root = Path(d)
+            (root / 'usr/bin').mkdir(parents=True)
+            (root / 'usr/bin/sbctl').write_text('#!/bin/sh\n')
+            (root / 'usr/bin/sbctl').chmod(0o755)
+            (root / 'var/lib/sbctl/keys/db').mkdir(parents=True)
+            (root / 'var/lib/sbctl/keys/db/db.key').write_text('KEY')
+            env = {k: v for k, v in os.environ.items() if k != 'XETAL_NO_SIGN'}
+            if no_sign:
+                env['XETAL_NO_SIGN'] = '1'
+            return subprocess.run(['bash', '-c', f'source {COMMON}; iso_sbctl_ready "$1"', 'x', str(root)],
+                                  env=env, capture_output=True, text=True, timeout=15).returncode
+
+    def test_keys_present_means_ready(self):
+        self.assertEqual(self.ready(False), 0)
+
+    def test_xetal_no_sign_turns_signing_and_pinning_off(self):
+        self.assertNotEqual(self.ready(True), 0)
 
 
 class WindowsDetectionTests(unittest.TestCase):

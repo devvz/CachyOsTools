@@ -246,6 +246,8 @@ iso_unmount_tree() {
 # iso_sbctl_ready [ROOT] - true if ROOT (default /) has sbctl and a db signing key.
 iso_sbctl_ready() {
     local root=${1:-}
+    # XETAL_NO_SIGN=1 turns off all Secure Boot signing and Limine hash pinning.
+    [[ ${XETAL_NO_SIGN:-0} != 1 ]] || return 1
     [[ -x $root/usr/bin/sbctl ]] &&
         { [[ -r $root/var/lib/sbctl/keys/db/db.key ]] || [[ -r $root/usr/share/secureboot/keys/db/db.key ]]; }
 }

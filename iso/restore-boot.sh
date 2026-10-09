@@ -8,7 +8,7 @@ restore_boot_main() {
     source /etc/xetal-boot.conf
     [[ $ROOT_UUID =~ ^[a-fA-F0-9-]+$ ]] || { iso_die 'Invalid root UUID.'; return 1; }
     [[ $BOOTLOADER == grub || $BOOTLOADER == systemd-boot || $BOOTLOADER == limine ]] || return 1
-    local tool kernels version pkgbase kernel image microcode entry entry_tmp config_tmp windows_guid
+    local tool kernels version pkgbase kernel image microcode entry entry_tmp config_tmp windows_guid early_modules
     local limine_conf=/efi/EFI/BOOT/limine.conf limine_efi=/efi/EFI/BOOT/BOOTX64.EFI limine_hash=0
     local -a post_options=()
     tool=$(iso_initramfs_tool /) || return 1
@@ -29,13 +29,13 @@ restore_boot_main() {
 
     # The restored root is a new, unencrypted ext4 filesystem. Do not embed the
     # source disk's encryption, LVM, resume UUIDs or Btrfs subvolume parameters.
-    cat > /etc/mkinitcpio-xetal.conf <<'EOF'
-MODULES=(ext4)
-BINARIES=()
-FILES=()
-HOOKS=(base udev modconf keyboard block filesystems fsck)
-COMPRESSION="gzip"
-EOF
+    # Keep any GPU driver the source loaded early (e.g. NVIDIA): such systems may not
+    # get a working display when the driver only loads after the root filesystem.
+    early_modules=$(restore_boot_gpu_modules) || early_modules=''
+    {
+        printf 'MODULES=(ext4%s)\n' "${early_modules:+ $early_modules}"
+        printf 'BINARIES=()\nFILES=()\nHOOKS=(base udev modconf keyboard block filesystems fsck)\nCOMPRESSION="gzip"\n'
+    } > /etc/mkinitcpio-xetal.conf
     mkdir -p /etc/dracut-xetal.conf.d
     printf 'hostonly="no"\nhostonly_cmdline="no"\n' > /etc/dracut-xetal.conf
     if [[ $tool == mkinitcpio ]] && mkinitcpio --help | grep -q -- --nopost; then post_options+=(--nopost); fi
@@ -136,6 +136,21 @@ EOF
         done
     fi
     echo '[*] Boot files regenerated successfully.'
+}
+
+# Prints (space separated) the known GPU driver modules that this system's mkinitcpio
+# config loads early. Everything else (btrfs, dm-crypt, ...) belongs to the source's disk
+# layout and must not leak into the restored ext4 root, so only a GPU allowlist is kept.
+restore_boot_gpu_modules() {
+    local m out=''
+    while read -r m; do
+        case $m in
+            nvidia|nvidia_modeset|nvidia_uvm|nvidia_drm|amdgpu|radeon|i915|xe|nouveau|virtio_gpu|vmwgfx|qxl|bochs)
+                [[ " $out " == *" $m "* ]] || out+="${out:+ }$m" ;;
+        esac
+    done < <(bash -c 'MODULES=(); for f in "$@"; do [[ -r $f ]] && . "$f"; done; printf "%s\n" "${MODULES[@]}"' \
+        _ /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf 2>/dev/null)
+    printf '%s' "$out"
 }
 
 # Prints "#<blake2b>" for FILE when Limine entries are hash-pinned, nothing otherwise.
