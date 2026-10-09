@@ -293,6 +293,12 @@ installer_main() {
     fi
     esp_mib=$((kernel_count * 512))
     (( esp_mib >= 2048 )) || esp_mib=2048
+    # Optional override: XETAL_ESP_MIB=4096 bash installer.sh   (EFI partition size in MiB)
+    if [[ -n ${XETAL_ESP_MIB:-} ]]; then
+        [[ $XETAL_ESP_MIB =~ ^[0-9]{3,5}$ ]] && (( 10#$XETAL_ESP_MIB >= 512 && 10#$XETAL_ESP_MIB <= 16384 )) || {
+            iso_die 'XETAL_ESP_MIB must be a whole number of MiB between 512 and 16384.'; return 1; }
+        esp_mib=$((10#$XETAL_ESP_MIB))
+    fi
     bytes=$((source_bytes + source_bytes / 5 + (esp_mib + 1024) * 1024 * 1024))
 
     install_mode=$(installer_choose_mode) || return 1

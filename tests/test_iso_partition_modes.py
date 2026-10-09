@@ -325,7 +325,7 @@ class DryRunTests(unittest.TestCase):
         (self.clone / 'snapshot.meta').write_text(
             f'FORMAT=1\nARCH=x86_64\nBYTES={20 * 1024 ** 3}\nUEFI={uefi}\nBIOS={bios}\nKERNELS=1\n')
 
-    def run_dry(self, stdin):
+    def run_dry(self, stdin, extra_env=None):
         body = MOCK + r'''
 source "$3"
 installer_show_logo() { :; }
@@ -343,9 +343,25 @@ installer_main --dry-run
 '''
         before = (self.state / 'rows').read_text()
         result = subprocess.run(['bash', '-c', body, 'test', str(self.state), str(COMMON), str(self.installer)],
-                                input=stdin, capture_output=True, text=True, timeout=15)
+                                input=stdin, capture_output=True, text=True, timeout=15,
+                                env=dict(os.environ, **(extra_env or {})))
         self.assertEqual((self.state / 'rows').read_text(), before, 'dry-run changed the partition table')
         return result
+
+    @unittest.skipUnless(os.uname().machine == 'x86_64', 'the installer only supports x86_64')
+    def test_esp_size_override_applies_to_the_plan(self):
+        default = self.run_dry('free\n')
+        self.assertIn('New EFI partition:  2048 MiB', default.stdout)
+        big = self.run_dry('free\n', {'XETAL_ESP_MIB': '4096'})
+        self.assertEqual(big.returncode, 0, big.stderr + big.stdout)
+        self.assertIn('New EFI partition:  4096 MiB', big.stdout)
+
+    @unittest.skipUnless(os.uname().machine == 'x86_64', 'the installer only supports x86_64')
+    def test_invalid_esp_size_override_is_rejected(self):
+        for bad in ('abc', '100', '99999', '4G', '-5'):
+            result = self.run_dry('free\n', {'XETAL_ESP_MIB': bad})
+            self.assertNotEqual(result.returncode, 0, bad)
+            self.assertIn('XETAL_ESP_MIB must be', result.stderr, bad)
 
     @unittest.skipUnless(os.uname().machine == 'x86_64', 'the installer only supports x86_64')
     def test_free_space_plan_is_printed_and_nothing_is_written(self):
