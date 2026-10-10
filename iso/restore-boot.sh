@@ -91,6 +91,8 @@ restore_boot_main() {
         if [[ $BOOTLOADER == limine ]]; then
             # Kernel and initramfs live on the FAT EFI partition, which Limine always reads.
             cp "/boot/xetal/vmlinuz-$version" "/efi/Xetal/vmlinuz-$version"
+            # Sign before hashing: signing changes the file, and the pinned hash must match.
+            iso_sign_boot_file "/efi/Xetal/vmlinuz-$version"
             cp "$image" "/efi/Xetal/initramfs-$version.img"
             {
                 printf '\n/Cloned system - %s\n    protocol: linux\n' "$pkgbase"

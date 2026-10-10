@@ -105,7 +105,7 @@ class RestoreBootTests(unittest.TestCase):
 iso_initramfs_tool() { echo mkinitcpio; }
 iso_kernels() { printf '6.1.0-test\tlinux-test\t%s\n' "$KERNEL_FILE"; }
 iso_sbctl_ready() { [[ ${MOCK_SB:-0} == 1 ]]; }
-iso_sign_boot_file() { echo "sign $1" >> "$MOCK_LOG"; }
+iso_sign_boot_file() { [[ ${MOCK_SB:-0} == 1 ]] || return 0; echo "sign $1" >> "$MOCK_LOG"; }
 iso_windows_esp_guid() { printf '%s' "${MOCK_WIN:-}"; }
 ''')
         text = RESTORE.read_text().replace('[[ $EUID == 0 ]]', 'true')
@@ -177,8 +177,10 @@ restore_boot_main
             if re.match(r'\s+(path|module_path):', line):
                 self.assertIn('#', line)
         log = self.log.read_text().splitlines()
-        self.assertEqual(len(log), 2, log)
-        enroll, sign = log
+        self.assertEqual(len(log), 3, log)
+        # the kernel copy is signed first, before its hash is pinned (signing changes the file)
+        self.assertEqual(log[0], f'sign {self.efi("Xetal/vmlinuz-6.1.0-test")}')
+        enroll, sign = log[1:]
         self.assertTrue(enroll.startswith('enroll enroll-config '), enroll)
         self.assertTrue(enroll.split()[2].endswith('BOOTX64.EFI.new'))
         self.assertEqual(enroll.split()[3], b2(conf_path))  # hash of the config exactly as written
@@ -209,7 +211,7 @@ restore_boot_main
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         conf_path = self.efi('EFI/BOOT/limine.conf')
         self.assertEqual(conf_path.read_text().splitlines()[:2], ['timeout: 5', 'graphics: no'])
-        enroll = self.log.read_text().splitlines()[0]
+        enroll = self.log.read_text().splitlines()[1]
         self.assertEqual(enroll.split()[3], b2(conf_path))
 
     def test_limine_graphics_is_not_written_by_default_or_for_other_values(self):
@@ -227,7 +229,7 @@ restore_boot_main
         conf = conf_path.read_text()
         self.assertIn(f'\n/Windows\n    protocol: efi\n    path: guid({self.WIN_GUID}):/EFI/Microsoft/Boot/bootmgfw.efi\n', conf)
         self.assertNotIn('bootmgfw.efi#', conf)  # Windows updates would stale a pinned hash
-        enroll = self.log.read_text().splitlines()[0]
+        enroll = self.log.read_text().splitlines()[1]
         self.assertEqual(enroll.split()[3], b2(conf_path))  # the enrolled hash includes the Windows entry
 
     def test_no_windows_entry_when_none_found(self):
