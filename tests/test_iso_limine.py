@@ -116,11 +116,11 @@ iso_windows_esp_guid() { printf '%s' "${MOCK_WIN:-}"; }
         self.log = self.r / 'mock.log'
         self.log.write_text('')
 
-    def boot_conf(self, bootloader):
-        (self.r / 'etc/xetal-boot.conf').write_text(f'ROOT_UUID={ROOT_UUID}\nBOOTLOADER={bootloader}\n')
+    def boot_conf(self, bootloader, extra=''):
+        (self.r / 'etc/xetal-boot.conf').write_text(f'ROOT_UUID={ROOT_UUID}\nBOOTLOADER={bootloader}\n{extra}')
 
-    def run_boot(self, bootloader, sb=False, win=''):
-        self.boot_conf(bootloader)
+    def run_boot(self, bootloader, sb=False, win='', extra=''):
+        self.boot_conf(bootloader, extra)
         body = r'''
 source "$1"
 mountpoint() { return 0; }
@@ -203,6 +203,20 @@ restore_boot_main
         conf = (self.r / 'etc/mkinitcpio-xetal.conf').read_text()
         self.assertEqual(conf, 'MODULES=(ext4)\nBINARIES=()\nFILES=()\n'
                                'HOOKS=(base udev modconf keyboard block filesystems fsck)\nCOMPRESSION="gzip"\n')
+
+    def test_limine_graphics_no_is_written_and_covered_by_the_enrolled_hash(self):
+        result = self.run_boot('limine', sb=True, extra='LIMINE_GRAPHICS=no\n')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        conf_path = self.efi('EFI/BOOT/limine.conf')
+        self.assertEqual(conf_path.read_text().splitlines()[:2], ['timeout: 5', 'graphics: no'])
+        enroll = self.log.read_text().splitlines()[0]
+        self.assertEqual(enroll.split()[3], b2(conf_path))
+
+    def test_limine_graphics_is_not_written_by_default_or_for_other_values(self):
+        for extra in ('', 'LIMINE_GRAPHICS=yes\n', 'LIMINE_GRAPHICS=nope\n'):
+            self.setUp()  # fresh sandbox for each case
+            self.assertEqual(self.run_boot('limine', extra=extra).returncode, 0, extra)
+            self.assertNotIn('graphics', self.efi('EFI/BOOT/limine.conf').read_text(), extra)
 
     WIN_GUID = '1b2c3d4e-0000-4000-8000-aabbccddeeff'
 

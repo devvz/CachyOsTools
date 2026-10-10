@@ -25,6 +25,9 @@ restore_boot_main() {
         # into the (signed) Limine binary and Limine boots under Secure Boot.
         if iso_sbctl_ready; then limine_hash=1; fi
         printf 'timeout: 5\n' > "$limine_conf.new"
+        # Some GPU/monitor combinations show nothing in Limine's graphical mode. Setting
+        # LIMINE_GRAPHICS=no in /etc/xetal-boot.conf keeps the text menu across updates.
+        if [[ ${LIMINE_GRAPHICS:-} == no ]]; then printf 'graphics: no\n' >> "$limine_conf.new"; fi
     fi
 
     # The restored root is a new, unencrypted ext4 filesystem. Do not embed the
