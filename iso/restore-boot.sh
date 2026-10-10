@@ -9,7 +9,7 @@ restore_boot_main() {
     [[ $ROOT_UUID =~ ^[a-fA-F0-9-]+$ ]] || { iso_die 'Invalid root UUID.'; return 1; }
     [[ $BOOTLOADER == grub || $BOOTLOADER == systemd-boot || $BOOTLOADER == limine ]] || return 1
     local tool kernels version pkgbase kernel image microcode entry entry_tmp config_tmp windows_guid early_modules
-    local limine_conf=/efi/EFI/BOOT/limine.conf limine_efi=/efi/EFI/BOOT/BOOTX64.EFI limine_hash=0
+    local limine_conf=/efi/EFI/BOOT/limine.conf limine_efi=/efi/EFI/BOOT/BOOTX64.EFI limine_hash=0 entry_n=0 default_n=0
     local -a post_options=()
     tool=$(iso_initramfs_tool /) || return 1
     kernels=$(iso_kernels /) || return 1
@@ -90,6 +90,9 @@ restore_boot_main() {
         fi
         if [[ $BOOTLOADER == limine ]]; then
             # Kernel and initramfs live on the FAT EFI partition, which Limine always reads.
+            # Default to the first kernel that is not an LTS one (entries are numbered from 1).
+            entry_n=$((entry_n + 1))
+            if (( default_n == 0 )) && [[ $pkgbase != *lts* ]]; then default_n=$entry_n; fi
             cp "/boot/xetal/vmlinuz-$version" "/efi/Xetal/vmlinuz-$version"
             # Sign before hashing: signing changes the file, and the pinned hash must match.
             iso_sign_boot_file "/efi/Xetal/vmlinuz-$version"
@@ -132,6 +135,7 @@ restore_boot_main() {
             printf '\n/Windows\n    protocol: efi\n    path: guid(%s):/EFI/Microsoft/Boot/bootmgfw.efi\n' \
                 "$windows_guid" >> "$limine_conf.new"
         fi
+        if (( default_n > 1 )); then sed -i "1a default_entry: $default_n" "$limine_conf.new"; fi
         restore_boot_limine "$limine_conf" "$limine_efi" "$limine_hash" || return 1
         # Remove only our kernel and initramfs copies for kernels that no longer exist.
         for image in /efi/Xetal/vmlinuz-* /efi/Xetal/initramfs-*.img; do

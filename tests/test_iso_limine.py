@@ -103,7 +103,12 @@ class RestoreBootTests(unittest.TestCase):
         (self.r / 'boot/intel-ucode.img').write_bytes(b'INTEL-MICROCODE')
         (self.r / 'usr/local/lib/xetal-iso/common.sh').write_text(COMMON.read_text() + r'''
 iso_initramfs_tool() { echo mkinitcpio; }
-iso_kernels() { printf '6.1.0-test\tlinux-test\t%s\n' "$KERNEL_FILE"; }
+iso_kernels() {
+    if [[ -n ${MOCK_KERNELS:-} ]]; then
+        local v p
+        for p in $MOCK_KERNELS; do v=${p#linux-}-ver; printf '%s\t%s\t%s\n' "$v" "$p" "$KERNEL_FILE"; done
+    else printf '6.1.0-test\tlinux-test\t%s\n' "$KERNEL_FILE"; fi
+}
 iso_sbctl_ready() { [[ ${MOCK_SB:-0} == 1 ]]; }
 iso_sign_boot_file() { [[ ${MOCK_SB:-0} == 1 ]] || return 0; echo "sign $1" >> "$MOCK_LOG"; }
 iso_windows_esp_guid() { printf '%s' "${MOCK_WIN:-}"; }
@@ -119,7 +124,7 @@ iso_windows_esp_guid() { printf '%s' "${MOCK_WIN:-}"; }
     def boot_conf(self, bootloader, extra=''):
         (self.r / 'etc/xetal-boot.conf').write_text(f'ROOT_UUID={ROOT_UUID}\nBOOTLOADER={bootloader}\n{extra}')
 
-    def run_boot(self, bootloader, sb=False, win='', extra=''):
+    def run_boot(self, bootloader, sb=False, win='', extra='', kernels=''):
         self.boot_conf(bootloader, extra)
         body = r'''
 source "$1"
@@ -130,7 +135,7 @@ mkinitcpio() { local out i; for ((i = 1; i <= $#; i++)); do [[ ${!i} == -g ]] &&
 limine() { echo "enroll $*" >> "$MOCK_LOG"; printf 'ENROLLED' >> "$2"; }
 restore_boot_main
 '''
-        env = dict(os.environ, MOCK_LOG=str(self.log), MOCK_SB='1' if sb else '0', MOCK_WIN=win,
+        env = dict(os.environ, MOCK_LOG=str(self.log), MOCK_SB='1' if sb else '0', MOCK_WIN=win, MOCK_KERNELS=kernels,
                    KERNEL_FILE=str(self.r / 'usr/lib/modules/6.1.0-test/vmlinuz'))
         return subprocess.run(['bash', '-c', body, 'test', str(self.script)],
                               capture_output=True, text=True, timeout=30, env=env)
@@ -161,6 +166,20 @@ restore_boot_main
         self.assertFalse(self.efi('loader').exists())  # no systemd-boot leftovers
         self.assertFalse((self.efi('EFI/BOOT/limine.conf.new')).exists())
         self.assertFalse((self.efi('EFI/BOOT/BOOTX64.EFI.new')).exists())
+
+    def test_default_entry_prefers_the_first_non_lts_kernel(self):
+        result = self.run_boot('limine', kernels='linux-lts linux linux-zen')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        lines = self.efi('EFI/BOOT/limine.conf').read_text().splitlines()
+        self.assertEqual(lines[:2], ['timeout: 5', 'default_entry: 2'])
+        titles = [l for l in lines if l.startswith('/')]
+        self.assertEqual(titles[1], '/Cloned system - linux')
+
+    def test_no_default_entry_when_the_first_kernel_is_already_the_default(self):
+        for kernels in ('', 'linux linux-lts', 'linux-lts'):
+            with self.subTest(kernels=kernels):
+                self.assertEqual(self.run_boot('limine', kernels=kernels).returncode, 0)
+                self.assertNotIn('default_entry', self.efi('EFI/BOOT/limine.conf').read_text())
 
     def test_limine_hash_pinning_enrolls_the_final_config_then_signs(self):
         result = self.run_boot('limine', sb=True)
